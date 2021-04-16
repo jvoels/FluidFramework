@@ -19,6 +19,7 @@ export interface IKafkaConsumerOptions extends Partial<IKafkaBaseOptions> {
 	optimizedRebalance: boolean;
 	commitRetryDelay: number;
 	automaticConsume: boolean;
+	maxConsumerCommitRetries: number;
 	additionalOptions?: kafkaTypes.ConsumerGlobalConfig;
 }
 
@@ -51,6 +52,7 @@ export class RdkafkaConsumer extends RdkafkaBase implements IConsumer {
 			optimizedRebalance: options?.optimizedRebalance ?? false,
 			commitRetryDelay: options?.commitRetryDelay ?? 1000,
 			automaticConsume: options?.automaticConsume ?? true,
+			maxConsumerCommitRetries: options?.maxConsumerCommitRetries ?? 10,
 		};
 	}
 
@@ -112,8 +114,10 @@ export class RdkafkaConsumer extends RdkafkaBase implements IConsumer {
 
 		consumer.on("offset.commit", (err, offsets) => {
 			let shouldRetryCommit = false;
+            console.log("[RDKAFKA OFFSET COMMIT LISTENER] Entered listener.");
 
 			if (err) {
+                console.log("[RDKAFKA OFFSET COMMIT LISTENER] There was an error.");
 				// a rebalance occurred while we were committing
 				// we can resubmit the commit if we still own the partition
 				shouldRetryCommit =
@@ -122,16 +126,20 @@ export class RdkafkaConsumer extends RdkafkaBase implements IConsumer {
 						err.code === kafka.CODES.ERRORS.ERR_ILLEGAL_GENERATION);
 
 				if (!shouldRetryCommit) {
+                    console.log("[RDKAFKA OFFSET COMMIT LISTENER] Should not retry commit. Will emit error.");
 					this.error(err);
 				}
 			}
 
+            console.log("[RDKAFKA OFFSET COMMIT LISTENER] Will now iterate over offsets.");
 			for (const offset of offsets) {
 				const deferredCommit = this.pendingCommits.get(offset.partition);
 				if (deferredCommit) {
 					if (shouldRetryCommit) {
+                        console.log("[RDKAFKA OFFSET COMMIT LISTENER] Will check if partition is there");
 						setTimeout(() => {
 							if (this.assignedPartitions.has(offset.partition)) {
+                                console.log("[RDKAFKA OFFSET COMMIT LISTENER] Will call commit for the offset");
 								// we still own this partition. checkpoint again
 								this.consumer?.commit(offset);
 							}
@@ -268,28 +276,53 @@ export class RdkafkaConsumer extends RdkafkaBase implements IConsumer {
 		}
 	}
 
-	public async commitCheckpoint(partitionId: number, queuedMessage: IQueuedMessage): Promise<void> {
-		if (!this.consumer) {
-			throw new Error("Invalid consumer");
+	public async commitCheckpoint(
+		partitionId: number,
+		queuedMessage: IQueuedMessage,
+		retries: number = 0): Promise<void> {
+		const startTime = Date.now();
+			try {
+				if (!this.consumer) {
+					throw new Error("Invalid consumer");
+				}
+
+				if (this.pendingCommits.has(partitionId)) {
+					throw new Error(`There is already a pending commit for partition ${partitionId}`);
+				}
+
+				// this will be resolved in the "offset.commit" event
+				const deferredCommit = new Deferred<void>();
+				this.pendingCommits.set(partitionId, deferredCommit);
+
+				// logs are replayed from the last checkpointed offset.
+				// to avoid reprocessing the last message twice, we checkpoint at offset + 1
+				this.consumer.commit({
+					topic: this.topic,
+					partition: partitionId,
+					offset: queuedMessage.offset + 1,
+				});
+
+				const latency = Date.now() - startTime;
+				this.emit("checkpoint_success", partitionId, queuedMessage, retries, latency);
+				console.log("[RDKAFKA COMMIT LOG] Commit checkpoint success in RdKafkaConsumer! Retry: ", retries);
+				return deferredCommit.promise;
+			} catch (ex) {
+				const hasPartition = this.assignedPartitions.has(partitionId);
+				const willRetry = this.consumer?.isConnected()
+									&& retries < this.consumerOptions.maxConsumerCommitRetries
+									&& hasPartition;
+
+				const latency = Date.now() - startTime;
+				this.emit("checkpoint_error", partitionId, queuedMessage, retries, latency, willRetry);
+				console.log("[RDKAFKA COMMIT LOG] Commit checkpoint error in RdKafkaConsumer. Error", ex);
+
+				if (willRetry) {
+					console.log("[RDKAFKA COMMIT LOG] Will retry after failure. Current retry count: ", retries);
+					return this.commitCheckpoint(partitionId, queuedMessage, retries + 1);
+				}
+
+				throw ex;
 		}
-
-		if (this.pendingCommits.has(partitionId)) {
-			throw new Error(`There is already a pending commit for partition ${partitionId}`);
-		}
-
-		// this will be resolved in the "offset.commit" event
-		const deferredCommit = new Deferred<void>();
-		this.pendingCommits.set(partitionId, deferredCommit);
-
-		// logs are replayed from the last checkpointed offset.
-		// to avoid reprocessing the last message twice, we checkpoint at offset + 1
-		this.consumer.commit({
-			topic: this.topic,
-			partition: partitionId,
-			offset: queuedMessage.offset + 1,
-		});
-
-		return deferredCommit.promise;
 	}
 
 	public async pause() {
